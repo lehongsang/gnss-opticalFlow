@@ -26,32 +26,105 @@ class OpticalFlowProcessor:
             )
             # Fallback to default CPU provider
             self.session = ort.InferenceSession(self.model_path)
+        self.flow_output_index = self.select_flow_output_index(self.session.get_outputs())
         logger.info(
-            "ONNX session ready model=%s providers=%s inputs=%s outputs=%s",
+            "ONNX session ready model=%s providers=%s inputs=%s outputs=%s flow_output_index=%s",
             self.model_path,
             self.session.get_providers(),
             [(item.name, item.shape, item.type) for item in self.session.get_inputs()],
             [(item.name, item.shape, item.type) for item in self.session.get_outputs()],
+            self.flow_output_index,
         )
         
         self.input_width = 480
         self.input_height = 360
+        self.flow_frame_offset = 3
         
         # Drawing parameters
-        self.draw_step = 30
-        self.min_motion_magnitude = 0.40
-        self.vector_color = (255, 255, 40) # BGR for (40, 255, 255)
-        self.dot_radius = 4
-        self.vector_thickness = 4
-        self.vector_length_multiplier = 3.6
-        self.min_display_vector_length = 9.0
+        self.draw_step = 34
+        self.min_motion_magnitude = 0.45
+        self.dot_radius = 2
+        self.vector_length_multiplier = 2.4
+        self.min_display_vector_length = 10.0
+        self.max_display_vector_length = 56.0
+        self.vector_activity_percentile = 58.0
+        self.vector_peak_percentile = 95.0
+        self.vector_shadow_alpha = 0.42
         
         # Heatmap parameters
-        self.heatmap_frame_weight = 0.58
-        self.heatmap_color_weight = 0.70
-        self.heatmap_normalize_multiplier = 9.0
-        self.heatmap_input_threshold_multiplier = 0.40
-        self.heatmap_mask_threshold_multiplier = 0.32
+        self.heatmap_peak_percentile = 98.5
+        self.heatmap_floor_percentile = 45.0
+        self.heatmap_gamma = 0.68
+        self.heatmap_max_alpha = 0.78
+        self.heatmap_background_weight = 0.72
+        self.heatmap_min_alpha = 0.08
+        self.turbo_lut = cv2.applyColorMap(
+            np.arange(256, dtype=np.uint8).reshape(256, 1),
+            cv2.COLORMAP_TURBO,
+        ).reshape(256, 3)
+
+    def select_flow_output_index(self, output_meta):
+        best_index = len(output_meta) - 1 if output_meta else 0
+        best_pixels = -1
+        for index, meta in enumerate(output_meta):
+            shape = list(getattr(meta, "shape", []) or [])
+            if len(shape) == 4 and shape[1] == 2:
+                height, width = shape[2], shape[3]
+            elif len(shape) == 4 and shape[3] == 2:
+                height, width = shape[1], shape[2]
+            elif len(shape) == 3 and shape[0] == 2:
+                height, width = shape[1], shape[2]
+            elif len(shape) == 3 and shape[2] == 2:
+                height, width = shape[0], shape[1]
+            else:
+                continue
+
+            try:
+                pixels = int(height) * int(width)
+            except (TypeError, ValueError):
+                pixels = 0
+            if pixels > best_pixels:
+                best_index = index
+                best_pixels = pixels
+        return best_index
+
+    def extract_flow_channels(self, flow, context, job_id=None, frame_index=None):
+        arr = np.asarray(flow)
+        if len(arr.shape) == 4 and arr.shape[1] == 2:
+            u = arr[0, 0, :, :]
+            v = arr[0, 1, :, :]
+        elif len(arr.shape) == 4 and arr.shape[3] == 2:
+            u = arr[0, :, :, 0]
+            v = arr[0, :, :, 1]
+        elif len(arr.shape) == 3 and arr.shape[0] == 2:
+            u = arr[0, :, :]
+            v = arr[1, :, :]
+        elif len(arr.shape) == 3 and arr.shape[2] == 2:
+            u = arr[:, :, 0]
+            v = arr[:, :, 1]
+        else:
+            logger.warning(
+                "Unsupported flow shape for %s job_id=%s frame=%s flow_shape=%s",
+                context,
+                job_id,
+                frame_index,
+                getattr(flow, "shape", None),
+            )
+            return None
+
+        u = np.nan_to_num(u.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        v = np.nan_to_num(v.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        return u, v
+
+    def postprocess_flow(self, outputs):
+        flow = np.asarray(outputs[min(self.flow_output_index, len(outputs) - 1)])
+        if len(flow.shape) == 4 and flow.shape[1] == 2:
+            return flow[0].transpose(1, 2, 0)
+        if len(flow.shape) == 4 and flow.shape[3] == 2:
+            return flow[0]
+        if len(flow.shape) == 3 and flow.shape[0] == 2:
+            return flow.transpose(1, 2, 0)
+        return flow
 
     def summarize_flow(self, flow):
         arr = np.asarray(flow)
@@ -78,10 +151,8 @@ class OpticalFlowProcessor:
         # Convert to RGB (swapRB=True in OpenCV is equivalent to BGR2RGB)
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         # Resize and convert to float32 NCHW format: (1, C, H, W)
-        resized = cv2.resize(img_rgb, (self.input_width, self.input_height), interpolation=cv2.INTER_AREA)
+        resized = cv2.resize(img_rgb, (self.input_width, self.input_height), interpolation=cv2.INTER_LINEAR)
         arr = resized.astype(np.float32)
-        # Normalize to [0,1]
-        arr /= 255.0
         # HWC -> CHW
         chw = np.transpose(arr, (2, 0, 1))
         blob = np.expand_dims(chw, axis=0)
@@ -124,8 +195,9 @@ class OpticalFlowProcessor:
                     feed[meta.name] = prev_blob if i == 0 else curr_blob
 
             outputs = self.session.run(None, feed)
-            # Return first output
-            return outputs[0]
+            if not outputs:
+                raise RuntimeError("model returned no outputs")
+            return self.postprocess_flow(outputs)
         except Exception as e:
             input_summary = [(meta.name, meta.shape, meta.type) for meta in input_meta]
             feed_summary = {name: tuple(value.shape) for name, value in feed.items()}
@@ -140,27 +212,10 @@ class OpticalFlowProcessor:
         return round((size - 1 - occupied_span) / 2.0)
 
     def draw_heatmap(self, flow, frame, job_id=None, frame_index=None):
-        # flow shape: typically (1, 2, H, W) for NCHW or (1, H, W, 2) for NHWC
-        if len(flow.shape) == 4 and flow.shape[1] == 2:
-            u = flow[0, 0, :, :]
-            v = flow[0, 1, :, :]
-        elif len(flow.shape) == 4 and flow.shape[3] == 2:
-            u = flow[0, :, :, 0]
-            v = flow[0, :, :, 1]
-        elif len(flow.shape) == 3 and flow.shape[0] == 2:
-            u = flow[0, :, :]
-            v = flow[1, :, :]
-        elif len(flow.shape) == 3 and flow.shape[2] == 2:
-            u = flow[:, :, 0]
-            v = flow[:, :, 1]
-        else:
-            logger.warning(
-                "Unsupported flow shape for heatmap job_id=%s frame=%s flow_shape=%s",
-                job_id,
-                frame_index,
-                getattr(flow, "shape", None),
-            )
+        channels = self.extract_flow_channels(flow, "heatmap", job_id=job_id, frame_index=frame_index)
+        if channels is None:
             return frame
+        u, v = channels
 
         flow_h, flow_w = u.shape
         frame_h, frame_w = frame.shape[:2]
@@ -168,67 +223,56 @@ class OpticalFlowProcessor:
         x_scale = frame_w / flow_w
         y_scale = frame_h / flow_h
 
-        # Calculate magnitude
         fx = u * x_scale
         fy = v * y_scale
-        magnitude = np.sqrt(fx**2 + fy**2)
-        
-        # Gaussian blur magnitude
-        magnitude = cv2.GaussianBlur(magnitude, (9, 9), 0.0)
-        
-        max_magnitude = np.max(magnitude)
-        if max_magnitude <= self.min_motion_magnitude * self.heatmap_input_threshold_multiplier:
+        magnitude = np.sqrt(fx**2 + fy**2).astype(np.float32)
+        magnitude = cv2.GaussianBlur(magnitude, (0, 0), 1.35)
+
+        active = magnitude[magnitude > self.min_motion_magnitude]
+        if active.size == 0:
             return frame
-            
-        normalize_max = max(max_magnitude, self.min_motion_magnitude * self.heatmap_normalize_multiplier)
-        
-        # Normalize to 0-255
-        normalized = (magnitude / normalize_max) * 255.0
-        normalized = np.clip(normalized, 0, 255).astype(np.uint8)
-        
-        heatmap8u = cv2.GaussianBlur(normalized, (15, 15), 0.0)
+
+        motion_floor = max(
+            self.min_motion_magnitude,
+            float(np.percentile(active, self.heatmap_floor_percentile)) * 0.75,
+        )
+        motion_peak = float(np.percentile(active, self.heatmap_peak_percentile))
+        motion_peak = max(motion_peak, motion_floor + 1e-3)
+
+        normalized = np.clip((magnitude - motion_floor) / (motion_peak - motion_floor), 0.0, 1.0)
+        normalized = np.power(normalized, self.heatmap_gamma)
+        normalized = cv2.GaussianBlur(normalized.astype(np.float32), (0, 0), 1.4)
+
+        heatmap8u = np.clip(normalized * 255.0, 0, 255).astype(np.uint8)
         heatmap_bgr = cv2.applyColorMap(heatmap8u, cv2.COLORMAP_TURBO)
         heatmap_scaled_bgr = cv2.resize(heatmap_bgr, (frame_w, frame_h), interpolation=cv2.INTER_CUBIC)
-        
-        # Mask
-        _, mask_small = cv2.threshold(magnitude, self.min_motion_magnitude * self.heatmap_mask_threshold_multiplier, 255.0, cv2.THRESH_BINARY)
-        mask_small = mask_small.astype(np.uint8)
-        mask = cv2.resize(mask_small, (frame_w, frame_h), interpolation=cv2.INTER_CUBIC)
-        mask = cv2.GaussianBlur(mask, (31, 31), 0.0)
-        _, mask = cv2.threshold(mask, 1.0, 255.0, cv2.THRESH_BINARY)
-        
-        # Blend
-        blended = cv2.addWeighted(frame, self.heatmap_frame_weight, heatmap_scaled_bgr, self.heatmap_color_weight, 0.0)
-        
-        # Apply mask
-        result_frame = np.copy(frame)
-        mask_bool = mask > 0
-        result_frame[mask_bool] = blended[mask_bool]
-        
+
+        alpha_small = np.where(
+            normalized > 0.01,
+            self.heatmap_min_alpha + normalized * (self.heatmap_max_alpha - self.heatmap_min_alpha),
+            0.0,
+        ).astype(np.float32)
+        alpha = cv2.resize(alpha_small, (frame_w, frame_h), interpolation=cv2.INTER_CUBIC)
+        alpha = np.clip(cv2.GaussianBlur(alpha, (0, 0), 1.8), 0.0, self.heatmap_max_alpha)
+        alpha3 = alpha[:, :, np.newaxis]
+
+        base = cv2.addWeighted(
+            frame,
+            self.heatmap_background_weight,
+            np.zeros_like(frame),
+            1.0 - self.heatmap_background_weight,
+            0.0,
+        ).astype(np.float32)
+        result_frame = base * (1.0 - alpha3) + heatmap_scaled_bgr.astype(np.float32) * alpha3
+        result_frame = np.clip(result_frame, 0, 255).astype(np.uint8)
+
         return result_frame
 
     def draw_vectors(self, flow, frame, vector_direction_sign=-1.0, job_id=None, frame_index=None):
-        # Determine layout and extract u, v
-        if len(flow.shape) == 4 and flow.shape[1] == 2:
-            u = flow[0, 0, :, :]
-            v = flow[0, 1, :, :]
-        elif len(flow.shape) == 4 and flow.shape[3] == 2:
-            u = flow[0, :, :, 0]
-            v = flow[0, :, :, 1]
-        elif len(flow.shape) == 3 and flow.shape[0] == 2:
-            u = flow[0, :, :]
-            v = flow[1, :, :]
-        elif len(flow.shape) == 3 and flow.shape[2] == 2:
-            u = flow[:, :, 0]
-            v = flow[:, :, 1]
-        else:
-            logger.warning(
-                "Unsupported flow shape for vectors job_id=%s frame=%s flow_shape=%s",
-                job_id,
-                frame_index,
-                getattr(flow, "shape", None),
-            )
+        channels = self.extract_flow_channels(flow, "vectors", job_id=job_id, frame_index=frame_index)
+        if channels is None:
             return frame
+        u, v = channels
 
         flow_h, flow_w = u.shape
         frame_h, frame_w = frame.shape[:2]
@@ -236,14 +280,12 @@ class OpticalFlowProcessor:
         x_scale = frame_w / flow_w
         y_scale = frame_h / flow_h
         
-        start_x = self.compute_centered_grid_start(frame_w, self.draw_step)
-        start_y = self.compute_centered_grid_start(frame_h, self.draw_step)
-        
-        min_motion_squared = self.min_motion_magnitude ** 2
-        
-        result_frame = np.copy(frame)
+        grid_step = max(self.draw_step, int(round(min(frame_w, frame_h) / 18.0)))
+        start_x = self.compute_centered_grid_start(frame_w, grid_step)
+        start_y = self.compute_centered_grid_start(frame_h, grid_step)
+
+        samples = []
         invalid_vectors = 0
-        
         screen_y = start_y
         while screen_y < frame_h:
             screen_x = start_x
@@ -255,46 +297,102 @@ class OpticalFlowProcessor:
                 fy = v[flow_y, flow_x] * y_scale
                 if not (math.isfinite(float(fx)) and math.isfinite(float(fy))):
                     invalid_vectors += 1
-                    screen_x += self.draw_step
+                    screen_x += grid_step
                     continue
-                
-                magnitude_squared = fx**2 + fy**2
-                
-                if magnitude_squared >= min_motion_squared:
-                    start_pt = (screen_x, screen_y)
-                    display_fx = fx * vector_direction_sign * self.vector_length_multiplier
-                    display_fy = fy * vector_direction_sign * self.vector_length_multiplier
-                    if not (math.isfinite(float(display_fx)) and math.isfinite(float(display_fy))):
-                        invalid_vectors += 1
-                        screen_x += self.draw_step
-                        continue
-                    
-                    display_magnitude = math.hypot(float(display_fx), float(display_fy))
-                    if 0.0 < display_magnitude < self.min_display_vector_length:
-                        scale_up = self.min_display_vector_length / display_magnitude
-                        display_fx *= scale_up
-                        display_fy *= scale_up
-                        
-                    end_x = float(start_pt[0] + display_fx)
-                    end_y = float(start_pt[1] + display_fy)
-                    max_endpoint_x = max(frame_w * 4.0, 1.0)
-                    max_endpoint_y = max(frame_h * 4.0, 1.0)
-                    if (
-                        not (math.isfinite(end_x) and math.isfinite(end_y))
-                        or abs(end_x) > max_endpoint_x
-                        or abs(end_y) > max_endpoint_y
-                    ):
-                        invalid_vectors += 1
-                        screen_x += self.draw_step
-                        continue
 
-                    end_pt = (int(round(end_x)), int(round(end_y)))
-                    
-                    cv2.line(result_frame, start_pt, end_pt, self.vector_color, self.vector_thickness)
-                    cv2.circle(result_frame, start_pt, self.dot_radius, self.vector_color, -1)
-                
-                screen_x += self.draw_step
-            screen_y += self.draw_step
+                magnitude = math.hypot(float(fx), float(fy))
+                if magnitude > 1e-3:
+                    samples.append((screen_x, screen_y, float(fx), float(fy), magnitude))
+
+                screen_x += grid_step
+            screen_y += grid_step
+
+        if not samples:
+            return frame
+
+        magnitudes = np.asarray([sample[4] for sample in samples], dtype=np.float32)
+        motion_threshold = max(
+            self.min_motion_magnitude,
+            float(np.percentile(magnitudes, self.vector_activity_percentile)) * 0.60,
+        )
+        motion_peak = float(np.percentile(magnitudes, self.vector_peak_percentile))
+        motion_peak = max(motion_peak, motion_threshold + 1e-3)
+
+        arrow_specs = []
+        max_endpoint_x = max(frame_w * 1.5, 1.0)
+        max_endpoint_y = max(frame_h * 1.5, 1.0)
+        for screen_x, screen_y, fx, fy, magnitude in samples:
+            if magnitude < motion_threshold:
+                continue
+            strength = max(0.0, min(1.0, (magnitude - motion_threshold) / (motion_peak - motion_threshold)))
+            raw_dx = fx * vector_direction_sign
+            raw_dy = fy * vector_direction_sign
+            raw_magnitude = math.hypot(raw_dx, raw_dy)
+            if raw_magnitude <= 1e-6:
+                continue
+
+            display_length = raw_magnitude * self.vector_length_multiplier
+            display_length = max(self.min_display_vector_length, min(self.max_display_vector_length, display_length))
+            display_dx = (raw_dx / raw_magnitude) * display_length
+            display_dy = (raw_dy / raw_magnitude) * display_length
+            end_x = float(screen_x + display_dx)
+            end_y = float(screen_y + display_dy)
+            if (
+                not (math.isfinite(end_x) and math.isfinite(end_y))
+                or abs(end_x) > max_endpoint_x
+                or abs(end_y) > max_endpoint_y
+            ):
+                invalid_vectors += 1
+                continue
+
+            color_index = int(max(48, min(255, round(64 + strength * 191))))
+            color = tuple(int(channel) for channel in self.turbo_lut[color_index])
+            arrow_specs.append(
+                (
+                    strength,
+                    (int(screen_x), int(screen_y)),
+                    (int(round(end_x)), int(round(end_y))),
+                    color,
+                )
+            )
+
+        if not arrow_specs:
+            return frame
+
+        arrow_specs.sort(key=lambda spec: spec[0])
+        thickness = max(1, int(round(min(frame_w, frame_h) / 420.0)))
+        shadow_thickness = thickness + 2
+        shadow_layer = np.copy(frame)
+        for _, start_pt, end_pt, _ in arrow_specs:
+            cv2.arrowedLine(
+                shadow_layer,
+                start_pt,
+                end_pt,
+                (10, 10, 10),
+                shadow_thickness,
+                line_type=cv2.LINE_AA,
+                tipLength=0.28,
+            )
+
+        result_frame = cv2.addWeighted(
+            shadow_layer,
+            self.vector_shadow_alpha,
+            frame,
+            1.0 - self.vector_shadow_alpha,
+            0.0,
+        )
+        for _, start_pt, end_pt, color in arrow_specs:
+            cv2.arrowedLine(
+                result_frame,
+                start_pt,
+                end_pt,
+                color,
+                thickness,
+                line_type=cv2.LINE_AA,
+                tipLength=0.28,
+            )
+            cv2.circle(result_frame, start_pt, self.dot_radius, (245, 245, 245), -1, lineType=cv2.LINE_AA)
+
         if invalid_vectors and (frame_index is None or frame_index <= 3 or frame_index % 30 == 0):
             logger.warning(
                 "Skipped non-finite vectors job_id=%s frame=%s invalid_samples=%s flow_summary=%s",
@@ -323,12 +421,13 @@ class OpticalFlowProcessor:
             mode = "VECTORS"
 
         logger.info(
-            "Video processing initializing job_id=%s mode=%s input_path=%s output_path=%s vector_direction_sign=%.1f",
+            "Video processing initializing job_id=%s mode=%s input_path=%s output_path=%s vector_direction_sign=%.1f flow_frame_offset=%s",
             req_id,
             mode,
             input_video_path,
             output_video_path,
             vector_direction_sign,
+            self.flow_frame_offset,
         )
 
         status_path = None
@@ -379,11 +478,11 @@ class OpticalFlowProcessor:
             except Exception:
                 total_frames = 0
 
-            ret, prev_frame = cap.read()
+            ret, first_frame = cap.read()
             if not ret:
                 raise Exception(f"Failed to read first frame from video: {input_video_path}")
 
-            height, width = prev_frame.shape[:2]
+            height, width = first_frame.shape[:2]
             if width <= 0 or height <= 0:
                 raise Exception(f"Invalid frame dimensions width={width} height={height}")
 
@@ -393,35 +492,38 @@ class OpticalFlowProcessor:
                 raise Exception(f"Failed to open output video writer: {output_video_path} codec=mp4v fps={fps} size={width}x{height}")
 
             logger.info(
-                "Video metadata job_id=%s mode=%s fps=%.3f width=%s height=%s total_frames=%s input_path=%s output_path=%s",
+                "Video metadata job_id=%s mode=%s fps=%.3f width=%s height=%s total_frames=%s flow_frame_offset=%s input_path=%s output_path=%s",
                 req_id,
                 mode,
                 fps,
                 width,
                 height,
                 total_frames,
+                self.flow_frame_offset,
                 input_video_path,
                 output_video_path,
             )
 
-            # Write first frame
-            out.write(prev_frame)
-            frames_processed = 1
-
-            # report initial progress (first frame written)
-            if total_frames > 0:
-                report_progress((frames_processed / total_frames) * 100)
+            frame_buffer = [first_frame]
 
             while True:
                 ret, curr_frame = cap.read()
                 if not ret:
                     break
 
+                frame_buffer.append(curr_frame)
+                if len(frame_buffer) <= self.flow_frame_offset:
+                    continue
+
+                # Match the OpenCV Zoo demo: estimate flow across a 3-frame gap,
+                # but keep this service's output frame count unchanged.
+                source_frame = frame_buffer[0]
+                comparison_frame = frame_buffer[-1]
                 frame_index = frames_processed + 1
                 flow_output = None
                 try:
-                    flow_output = self.infer(prev_frame, curr_frame)
-                    if frame_index == 2:
+                    flow_output = self.infer(source_frame, comparison_frame)
+                    if frames_processed == 0:
                         logger.info(
                             "First flow output job_id=%s mode=%s frame=%s flow_summary=%s",
                             req_id,
@@ -431,27 +533,33 @@ class OpticalFlowProcessor:
                         )
 
                     if mode == "HEATMAP":
-                        result_frame = self.draw_heatmap(flow_output, curr_frame, job_id=req_id, frame_index=frame_index)
+                        result_frame = self.draw_heatmap(flow_output, source_frame, job_id=req_id, frame_index=frame_index)
                     else:
-                        result_frame = self.draw_vectors(flow_output, curr_frame, vector_direction_sign, job_id=req_id, frame_index=frame_index)
+                        result_frame = self.draw_vectors(flow_output, source_frame, vector_direction_sign, job_id=req_id, frame_index=frame_index)
                 except Exception as e:
                     flow_summary = self.summarize_flow(flow_output) if flow_output is not None else None
                     logger.exception(
-                        "Frame processing failed job_id=%s mode=%s frame=%s prev_frame_shape=%s curr_frame_shape=%s flow_summary=%s error=%s",
+                        "Frame processing failed job_id=%s mode=%s frame=%s source_frame_shape=%s comparison_frame_shape=%s flow_summary=%s error=%s",
                         req_id,
                         mode,
                         frame_index,
-                        getattr(prev_frame, "shape", None),
-                        getattr(curr_frame, "shape", None),
+                        getattr(source_frame, "shape", None),
+                        getattr(comparison_frame, "shape", None),
                         flow_summary,
                         e,
                     )
                     raise RuntimeError(f"Frame {frame_index} processing failed in {mode} mode: {e}") from e
                     
                 out.write(result_frame)
-                prev_frame = curr_frame
                 frames_processed += 1
+                frame_buffer.pop(0)
                 # update status every 5 frames
+                if total_frames > 0 and frames_processed % 5 == 0:
+                    report_progress((frames_processed / total_frames) * 100)
+
+            while frame_buffer:
+                out.write(frame_buffer.pop(0))
+                frames_processed += 1
                 if total_frames > 0 and frames_processed % 5 == 0:
                     report_progress((frames_processed / total_frames) * 100)
             completed = True
