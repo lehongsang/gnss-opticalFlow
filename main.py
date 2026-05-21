@@ -8,6 +8,7 @@ import shutil
 import os
 import json
 import uuid
+import tempfile
 from inference import OpticalFlowProcessor
 
 app = FastAPI(title="Optical Flow Server")
@@ -38,9 +39,6 @@ except Exception as e:
     print(f"Warning: Failed to load model {MODEL_PATH}. Error: {e}")
     processor = None
 
-TEMP_DIR = "temp_videos"
-os.makedirs(TEMP_DIR, exist_ok=True)
-
 def cleanup_files(file_paths):
     for path in file_paths:
         try:
@@ -49,9 +47,6 @@ def cleanup_files(file_paths):
         except Exception as e:
             print(f"Failed to cleanup {path}: {e}")
 
-
-def status_file_for(req_id: str):
-    return os.path.join(TEMP_DIR, f"{req_id}_status.json")
 
 @app.post("/process-video")
 async def process_video(
@@ -68,50 +63,36 @@ async def process_video(
     if not processor:
         return {"error": "Model not loaded on server."}
 
-    # Save uploaded video
-    req_id = str(uuid.uuid4())
-    input_filename = f"{req_id}_input.mp4"
-    output_filename = f"{req_id}_output.mp4"
-    
-    input_path = os.path.join(TEMP_DIR, input_filename)
-    output_path = os.path.join(TEMP_DIR, output_filename)
-    
+    # Save uploaded video to system temporary files
+    input_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    input_path = input_temp.name
+    input_temp.close()
     with open(input_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-        
+
+    output_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    output_path = output_temp.name
+    output_temp.close()
+
     vector_direction_sign = 1.0 if is_moving else -1.0
-    
+
     try:
-        # Process the video
-        processor.process_video(input_path, output_path, mode=mode.upper(), vector_direction_sign=vector_direction_sign, req_id=req_id)
-        
+        # Process the video (no status file)
+        processor.process_video(input_path, output_path, mode=mode.upper(), vector_direction_sign=vector_direction_sign)
+
         # Schedule cleanup after sending response
-        # also cleanup status file
-        status_path = status_file_for(req_id)
-        background_tasks.add_task(cleanup_files, [input_path, output_path, status_path])
-        
+        background_tasks.add_task(cleanup_files, [input_path, output_path])
+
         return FileResponse(
-            path=output_path, 
+            path=output_path,
             media_type="video/mp4",
-            filename=output_filename
+            filename=os.path.basename(output_path)
         )
     except Exception as e:
-        # cleanup status file on error
-        status_path = status_file_for(req_id)
-        cleanup_files([input_path, output_path, status_path])
+        # cleanup temp files on error
+        cleanup_files([input_path, output_path])
         return {"error": str(e)}
 
-
-@app.get('/status/{req_id}')
-def get_status(req_id: str):
-    status_path = status_file_for(req_id)
-    if os.path.exists(status_path):
-        try:
-            with open(status_path, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return {"percent": 0}
-    return {"percent": 0}
 
 @app.get("/health")
 def health_check():
