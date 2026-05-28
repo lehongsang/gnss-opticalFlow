@@ -68,6 +68,12 @@ class VideoJob:
 
 video_jobs = {}
 video_jobs_lock = threading.Lock()
+MAX_CONCURRENT_VIDEO_JOBS = max(1, int(os.getenv("OPTICAL_FLOW_MAX_CONCURRENT_VIDEO_JOBS", "3")))
+MAX_PENDING_VIDEO_JOBS = max(
+    MAX_CONCURRENT_VIDEO_JOBS,
+    int(os.getenv("OPTICAL_FLOW_MAX_PENDING_VIDEO_JOBS", "8")),
+)
+video_job_slots = threading.Semaphore(MAX_CONCURRENT_VIDEO_JOBS)
 
 
 def cleanup_files(file_paths):
@@ -97,6 +103,28 @@ def get_video_job(job_id: str) -> Optional[VideoJob]:
 def remove_video_job(job_id: str):
     with video_jobs_lock:
         video_jobs.pop(job_id, None)
+
+
+def video_job_counts():
+    with video_jobs_lock:
+        jobs = list(video_jobs.values())
+    queued = sum(1 for job in jobs if job.status == "queued")
+    processing = sum(1 for job in jobs if job.status in ("processing", "cancelling"))
+    completed = sum(1 for job in jobs if job.status == "completed")
+    failed = sum(1 for job in jobs if job.status == "failed")
+    cancelled = sum(1 for job in jobs if job.status == "cancelled")
+    pending = queued + processing
+    return {
+        "queued": queued,
+        "processing": processing,
+        "pending": pending,
+        "completed": completed,
+        "failed": failed,
+        "cancelled": cancelled,
+        "total": len(jobs),
+        "max_concurrent": MAX_CONCURRENT_VIDEO_JOBS,
+        "max_pending": MAX_PENDING_VIDEO_JOBS,
+    }
 
 
 def is_video_job_cancel_requested(job_id: str) -> bool:
@@ -132,6 +160,15 @@ def vector_direction_sign_for_motion(is_moving: bool) -> float:
     return 1.0 if is_moving else -1.0
 
 
+def acquire_video_job_slot(job_id: str) -> bool:
+    while True:
+        if is_video_job_cancel_requested(job_id):
+            set_video_job(job_id, status="cancelled", error="Cancelled by client.")
+            return False
+        if video_job_slots.acquire(timeout=1.0):
+            return True
+
+
 def run_video_job(job_id: str):
     job = get_video_job(job_id)
     if not job:
@@ -147,12 +184,26 @@ def run_video_job(job_id: str):
         logger.info("Video job cancelled before processing job_id=%s", job_id)
         return
 
-    set_video_job(job_id, status="processing", progress=0)
-    vector_direction_sign = vector_direction_sign_for_motion(job.is_moving)
-    def update_progress(percent):
-        set_video_job(job_id, progress=max(0, min(100, int(percent))))
-
+    slot_acquired = False
     try:
+        logger.info(
+            "Video job waiting for processing slot job_id=%s pending=%s max_concurrent=%s",
+            job_id,
+            video_job_counts()["pending"],
+            MAX_CONCURRENT_VIDEO_JOBS,
+        )
+        slot_acquired = acquire_video_job_slot(job_id)
+        if not slot_acquired:
+            cleanup_files([job.input_path, job.output_path])
+            logger.info("Video job cancelled while queued job_id=%s", job_id)
+            return
+
+        set_video_job(job_id, status="processing", progress=0)
+        vector_direction_sign = vector_direction_sign_for_motion(job.is_moving)
+
+        def update_progress(percent):
+            set_video_job(job_id, progress=max(0, min(100, int(percent))))
+
         input_size = os.path.getsize(job.input_path) if os.path.exists(job.input_path) else -1
         logger.info(
             "Video job started job_id=%s mode=%s is_moving=%s vector_direction_sign=%.1f input_path=%s input_size_bytes=%s output_path=%s",
@@ -190,6 +241,8 @@ def run_video_job(job_id: str):
         set_video_job(job_id, status="failed", error=str(e))
         logger.exception("Video job failed job_id=%s mode=%s error=%s", job_id, job.mode, e)
     finally:
+        if slot_acquired:
+            video_job_slots.release()
         cleanup_files([job.input_path])
 
 
@@ -275,6 +328,22 @@ async def create_process_video_job(
         logger.error("Async process-video job rejected because model is not loaded filename=%s", file.filename)
         raise HTTPException(status_code=503, detail="Model not loaded on server.")
 
+    counts = video_job_counts()
+    if counts["pending"] >= MAX_PENDING_VIDEO_JOBS:
+        logger.warning(
+            "Async process-video job rejected because queue is full filename=%s pending=%s max_pending=%s",
+            file.filename,
+            counts["pending"],
+            MAX_PENDING_VIDEO_JOBS,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Too many video jobs queued or processing "
+                f"({counts['pending']}/{MAX_PENDING_VIDEO_JOBS})."
+            ),
+        )
+
     input_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     input_path = input_temp.name
     input_temp.close()
@@ -314,7 +383,11 @@ async def create_process_video_job(
         output_path,
     )
     background_tasks.add_task(run_video_job, job_id)
-    return {"job_id": job_id, "status": job.status}
+    return {
+        "job_id": job_id,
+        "status": job.status,
+        "queue": video_job_counts(),
+    }
 
 
 @app.post("/process-video/jobs/{job_id}/cancel")
@@ -374,4 +447,8 @@ def get_process_video_job_result(job_id: str, background_tasks: BackgroundTasks)
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "model_loaded": processor is not None}
+    return {
+        "status": "ok",
+        "model_loaded": processor is not None,
+        "video_jobs": video_job_counts(),
+    }

@@ -7,6 +7,9 @@ https://developers.cloudflare.com/tunnel/downloads/
 - Add it to path environment variables
 - Step 1: Run server:
 uvicorn main:app --host 0.0.0.0 --port 8000
+- Optional server load limits:
+OPTICAL_FLOW_MAX_CONCURRENT_VIDEO_JOBS=3
+OPTICAL_FLOW_MAX_PENDING_VIDEO_JOBS=8
 - Step 2: Run cloud flare:
 cloudflared tunnel --url http://localhost:8000
 - Step 3: Copy the url cloudflared gave you and paste it to local properties in android app 
