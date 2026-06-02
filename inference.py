@@ -7,6 +7,8 @@ import logging
 import shutil
 import subprocess
 import onnxruntime as ort
+from dataclasses import dataclass
+from typing import Optional
 
 try:
     import imageio_ffmpeg
@@ -18,6 +20,31 @@ logger = logging.getLogger("optical_flow.inference")
 
 class ProcessingCancelled(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class NormalizedPoint:
+    x: float
+    y: float
+
+
+@dataclass(frozen=True)
+class NormalizedRoi:
+    left: float
+    top: float
+    right: float
+    bottom: float
+    view_aspect_ratio: float
+    path_points: list
+
+
+@dataclass(frozen=True)
+class ActiveRoi:
+    x: int
+    y: int
+    width: int
+    height: int
+    mask: Optional[np.ndarray] = None
 
 
 class H264Mp4Writer:
@@ -386,6 +413,99 @@ class OpticalFlowProcessor:
         occupied_span = (sample_count - 1) * step
         return round((size - 1 - occupied_span) / 2.0)
 
+    def active_roi(self, frame, roi: Optional[NormalizedRoi], job_id=None):
+        if roi is None or frame is None:
+            return None
+
+        frame_h, frame_w = frame.shape[:2]
+        if frame_w <= 0 or frame_h <= 0:
+            return None
+
+        view_height = 1.0
+        view_width = max(float(getattr(roi, "view_aspect_ratio", 1.0) or 1.0), 0.01)
+        scale = max(view_width / float(frame_w), view_height / float(frame_h))
+        offset_x = ((frame_w * scale) - view_width) / 2.0
+        offset_y = ((frame_h * scale) - view_height) / 2.0
+
+        def map_x(normalized_x):
+            return int(round(((float(normalized_x) * view_width) + offset_x) / scale))
+
+        def map_y(normalized_y):
+            return int(round(((float(normalized_y) * view_height) + offset_y) / scale))
+
+        left = min(max(map_x(roi.left), 0), frame_w - 1)
+        top = min(max(map_y(roi.top), 0), frame_h - 1)
+        right = min(max(map_x(roi.right), left + 1), frame_w)
+        bottom = min(max(map_y(roi.bottom), top + 1), frame_h)
+        width = right - left
+        height = bottom - top
+        if width < 32 or height < 32:
+            logger.warning(
+                "Ignoring ROI because mapped frame region is too small job_id=%s roi=%s frame_size=%sx%s mapped=%s,%s,%s,%s",
+                job_id,
+                self.roi_summary(roi),
+                frame_w,
+                frame_h,
+                left,
+                top,
+                right,
+                bottom,
+            )
+            return None
+
+        mask = self.create_roi_mask(roi, frame_w, frame_h, left, top, width, height, map_x, map_y)
+        return ActiveRoi(x=left, y=top, width=width, height=height, mask=mask)
+
+    def create_roi_mask(self, roi, frame_w, frame_h, left, top, width, height, map_x, map_y):
+        path_points = getattr(roi, "path_points", None) or []
+        if len(path_points) < 3:
+            return None
+
+        polygon = []
+        for point in path_points:
+            point_x = min(max(map_x(point.x), 0), frame_w - 1) - left
+            point_y = min(max(map_y(point.y), 0), frame_h - 1) - top
+            polygon.append([point_x, point_y])
+        if len(polygon) < 3:
+            return None
+
+        mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillPoly(mask, [np.asarray(polygon, dtype=np.int32)], 255)
+        return mask
+
+    def draw_flow_result(self, flow_output, frame, mode, vector_direction_sign, active_roi=None, job_id=None, frame_index=None):
+        if active_roi is None:
+            if mode == "HEATMAP":
+                return self.draw_heatmap(flow_output, frame, job_id=job_id, frame_index=frame_index)
+            return self.draw_vectors(flow_output, frame, vector_direction_sign, job_id=job_id, frame_index=frame_index)
+
+        roi_view = frame[
+            active_roi.y:active_roi.y + active_roi.height,
+            active_roi.x:active_roi.x + active_roi.width,
+        ]
+        if mode == "HEATMAP":
+            result_roi = self.draw_heatmap(flow_output, roi_view, job_id=job_id, frame_index=frame_index)
+        else:
+            result_roi = self.draw_vectors(flow_output, roi_view, vector_direction_sign, job_id=job_id, frame_index=frame_index)
+
+        if active_roi.mask is None:
+            roi_view[:] = result_roi
+        else:
+            np.copyto(roi_view, result_roi, where=active_roi.mask[:, :, np.newaxis] > 0)
+        return frame
+
+    def roi_summary(self, roi):
+        if roi is None:
+            return None
+        return {
+            "left": round(float(roi.left), 4),
+            "top": round(float(roi.top), 4),
+            "right": round(float(roi.right), 4),
+            "bottom": round(float(roi.bottom), 4),
+            "view_aspect_ratio": round(float(roi.view_aspect_ratio), 4),
+            "path_points": len(getattr(roi, "path_points", None) or []),
+        }
+
     def draw_heatmap(self, flow, frame, job_id=None, frame_index=None):
         channels = self.extract_flow_channels(flow, "heatmap", job_id=job_id, frame_index=frame_index)
         if channels is None:
@@ -585,6 +705,7 @@ class OpticalFlowProcessor:
         output_video_path,
         mode="VECTORS",
         vector_direction_sign=-1.0,
+        roi: Optional[NormalizedRoi] = None,
         req_id: str = None,
         progress_callback=None,
         cancel_callback=None,
@@ -597,13 +718,14 @@ class OpticalFlowProcessor:
             mode = "VECTORS"
 
         logger.info(
-            "Video processing initializing job_id=%s mode=%s input_path=%s output_path=%s vector_direction_sign=%.1f flow_frame_offset=%s",
+            "Video processing initializing job_id=%s mode=%s input_path=%s output_path=%s vector_direction_sign=%.1f flow_frame_offset=%s roi=%s",
             req_id,
             mode,
             input_video_path,
             output_video_path,
             vector_direction_sign,
             self.flow_frame_offset,
+            self.roi_summary(roi),
         )
 
         status_path = None
@@ -677,10 +799,11 @@ class OpticalFlowProcessor:
             if width <= 0 or height <= 0:
                 raise Exception(f"Invalid frame dimensions width={width} height={height}")
 
+            active_roi = self.active_roi(first_frame, roi, job_id=req_id)
             out = H264Mp4Writer(output_video_path, fps, width, height, req_id=req_id).open()
 
             logger.info(
-                "Video metadata job_id=%s mode=%s input_fps=%.3f output_fps=%.3f width=%s height=%s total_frames=%s flow_frame_offset=%s input_path=%s output_path=%s codec=h264",
+                "Video metadata job_id=%s mode=%s input_fps=%.3f output_fps=%.3f width=%s height=%s total_frames=%s flow_frame_offset=%s active_roi=%s input_path=%s output_path=%s codec=h264",
                 req_id,
                 mode,
                 fps,
@@ -689,6 +812,13 @@ class OpticalFlowProcessor:
                 height,
                 total_frames,
                 self.flow_frame_offset,
+                None if active_roi is None else {
+                    "x": active_roi.x,
+                    "y": active_roi.y,
+                    "width": active_roi.width,
+                    "height": active_roi.height,
+                    "has_mask": active_roi.mask is not None,
+                },
                 input_video_path,
                 output_video_path,
             )
@@ -710,33 +840,52 @@ class OpticalFlowProcessor:
                 source_frame = frame_buffer[0]
                 comparison_frame = frame_buffer[-1]
                 frame_index = frames_processed + 1
+                source_for_inference = source_frame
+                comparison_for_inference = comparison_frame
+                if active_roi is not None:
+                    source_for_inference = source_frame[
+                        active_roi.y:active_roi.y + active_roi.height,
+                        active_roi.x:active_roi.x + active_roi.width,
+                    ]
+                    comparison_for_inference = comparison_frame[
+                        active_roi.y:active_roi.y + active_roi.height,
+                        active_roi.x:active_roi.x + active_roi.width,
+                    ]
+
                 flow_output = None
                 try:
                     raise_if_cancelled()
-                    flow_output = self.infer(source_frame, comparison_frame)
+                    flow_output = self.infer(source_for_inference, comparison_for_inference)
                     raise_if_cancelled()
                     if frames_processed == 0:
                         logger.info(
-                            "First flow output job_id=%s mode=%s frame=%s flow_summary=%s",
+                            "First flow output job_id=%s mode=%s frame=%s roi_active=%s flow_summary=%s",
                             req_id,
                             mode,
                             frame_index,
+                            active_roi is not None,
                             self.summarize_flow(flow_output),
                         )
 
-                    if mode == "HEATMAP":
-                        result_frame = self.draw_heatmap(flow_output, source_frame, job_id=req_id, frame_index=frame_index)
-                    else:
-                        result_frame = self.draw_vectors(flow_output, source_frame, vector_direction_sign, job_id=req_id, frame_index=frame_index)
+                    result_frame = self.draw_flow_result(
+                        flow_output,
+                        source_frame,
+                        mode,
+                        vector_direction_sign,
+                        active_roi=active_roi,
+                        job_id=req_id,
+                        frame_index=frame_index,
+                    )
                 except Exception as e:
                     flow_summary = self.summarize_flow(flow_output) if flow_output is not None else None
                     logger.exception(
-                        "Frame processing failed job_id=%s mode=%s frame=%s source_frame_shape=%s comparison_frame_shape=%s flow_summary=%s error=%s",
+                        "Frame processing failed job_id=%s mode=%s frame=%s roi_active=%s source_frame_shape=%s comparison_frame_shape=%s flow_summary=%s error=%s",
                         req_id,
                         mode,
                         frame_index,
-                        getattr(source_frame, "shape", None),
-                        getattr(comparison_frame, "shape", None),
+                        active_roi is not None,
+                        getattr(source_for_inference, "shape", None),
+                        getattr(comparison_for_inference, "shape", None),
                         flow_summary,
                         e,
                     )

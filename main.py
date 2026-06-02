@@ -12,9 +12,10 @@ import uuid
 import tempfile
 import threading
 import time
+import math
 from dataclasses import dataclass, asdict
 from typing import Optional
-from inference import OpticalFlowProcessor, ProcessingCancelled
+from inference import NormalizedPoint, NormalizedRoi, OpticalFlowProcessor, ProcessingCancelled
 
 LOG_LEVEL = os.getenv("OPTICAL_FLOW_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -63,6 +64,7 @@ class VideoJob:
     output_path: str
     mode: str
     is_moving: bool
+    roi: Optional[NormalizedRoi] = None
     progress: int = 0
     error: Optional[str] = None
     cancel_requested: bool = False
@@ -284,7 +286,14 @@ def reject_if_video_job_queue_full(filename: str):
         )
 
 
-def enqueue_video_job(background_tasks: BackgroundTasks, input_path: str, filename: str, mode_name: str, resolved_is_moving: bool):
+def enqueue_video_job(
+    background_tasks: BackgroundTasks,
+    input_path: str,
+    filename: str,
+    mode_name: str,
+    resolved_is_moving: bool,
+    roi: Optional[NormalizedRoi] = None,
+):
     output_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     output_path = output_temp.name
     output_temp.close()
@@ -297,6 +306,7 @@ def enqueue_video_job(background_tasks: BackgroundTasks, input_path: str, filena
         output_path=output_path,
         mode=mode_name,
         is_moving=resolved_is_moving,
+        roi=roi,
         progress=0,
     )
     with video_jobs_lock:
@@ -304,11 +314,12 @@ def enqueue_video_job(background_tasks: BackgroundTasks, input_path: str, filena
 
     input_size = os.path.getsize(input_path) if os.path.exists(input_path) else -1
     logger.info(
-        "Video job queued job_id=%s filename=%s mode=%s resolved_is_moving=%s input_path=%s input_size_bytes=%s output_path=%s",
+        "Video job queued job_id=%s filename=%s mode=%s resolved_is_moving=%s roi=%s input_path=%s input_size_bytes=%s output_path=%s",
         job_id,
         filename,
         mode_name,
         resolved_is_moving,
+        roi_log_payload(roi),
         input_path,
         input_size,
         output_path,
@@ -352,6 +363,99 @@ def resolve_is_moving(is_moving: Optional[bool], isMoving: Optional[bool]) -> bo
 
 def vector_direction_sign_for_motion(is_moving: bool) -> float:
     return 1.0 if is_moving else -1.0
+
+
+def finite_float(value) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def clamp_unit(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def parse_roi_path_points(raw_path_points: Optional[str]):
+    points = []
+    if not raw_path_points:
+        return points
+    for raw_point in raw_path_points.split(";"):
+        raw_point = raw_point.strip()
+        if not raw_point:
+            continue
+        parts = raw_point.split(",", 1)
+        if len(parts) != 2:
+            continue
+        x = finite_float(parts[0])
+        y = finite_float(parts[1])
+        if x is None or y is None:
+            continue
+        points.append(NormalizedPoint(x=clamp_unit(x), y=clamp_unit(y)))
+    return points
+
+
+def resolve_roi(
+    roi_enabled: Optional[bool],
+    roi_left: Optional[float],
+    roi_top: Optional[float],
+    roi_right: Optional[float],
+    roi_bottom: Optional[float],
+    roi_view_aspect_ratio: Optional[float],
+    roi_path_points: Optional[str],
+) -> Optional[NormalizedRoi]:
+    if roi_enabled is False:
+        return None
+
+    raw_values = (roi_left, roi_top, roi_right, roi_bottom)
+    has_any_roi_value = any(value is not None for value in raw_values)
+    if not roi_enabled and not has_any_roi_value:
+        return None
+    if any(value is None for value in raw_values):
+        if roi_enabled:
+            raise HTTPException(status_code=400, detail="ROI is enabled but rectangle coordinates are missing.")
+        return None
+
+    left = finite_float(roi_left)
+    top = finite_float(roi_top)
+    right = finite_float(roi_right)
+    bottom = finite_float(roi_bottom)
+    if left is None or top is None or right is None or bottom is None:
+        raise HTTPException(status_code=400, detail="ROI rectangle coordinates must be finite numbers.")
+
+    left, right = sorted((clamp_unit(left), clamp_unit(right)))
+    top, bottom = sorted((clamp_unit(top), clamp_unit(bottom)))
+    if right - left <= 1e-6 or bottom - top <= 1e-6:
+        raise HTTPException(status_code=400, detail="ROI rectangle must have positive width and height.")
+
+    view_aspect_ratio = finite_float(roi_view_aspect_ratio)
+    if view_aspect_ratio is None or view_aspect_ratio <= 0.0:
+        view_aspect_ratio = 1.0
+
+    return NormalizedRoi(
+        left=left,
+        top=top,
+        right=right,
+        bottom=bottom,
+        view_aspect_ratio=view_aspect_ratio,
+        path_points=parse_roi_path_points(roi_path_points),
+    )
+
+
+def roi_log_payload(roi: Optional[NormalizedRoi]):
+    if roi is None:
+        return None
+    return {
+        "left": round(roi.left, 4),
+        "top": round(roi.top, 4),
+        "right": round(roi.right, 4),
+        "bottom": round(roi.bottom, 4),
+        "view_aspect_ratio": round(roi.view_aspect_ratio, 4),
+        "path_points": len(roi.path_points),
+    }
 
 
 def acquire_video_job_slot(job_id: str) -> bool:
@@ -400,11 +504,12 @@ def run_video_job(job_id: str):
 
         input_size = os.path.getsize(job.input_path) if os.path.exists(job.input_path) else -1
         logger.info(
-            "Video job started job_id=%s mode=%s is_moving=%s vector_direction_sign=%.1f input_path=%s input_size_bytes=%s output_path=%s",
+            "Video job started job_id=%s mode=%s is_moving=%s vector_direction_sign=%.1f roi=%s input_path=%s input_size_bytes=%s output_path=%s",
             job_id,
             job.mode,
             job.is_moving,
             vector_direction_sign,
+            roi_log_payload(job.roi),
             job.input_path,
             input_size,
             job.output_path,
@@ -414,6 +519,7 @@ def run_video_job(job_id: str):
             job.output_path,
             mode=job.mode.upper(),
             vector_direction_sign=vector_direction_sign,
+            roi=job.roi,
             req_id=job_id,
             progress_callback=update_progress,
             cancel_callback=lambda: is_video_job_cancel_requested(job_id),
@@ -446,7 +552,14 @@ async def process_video(
     file: UploadFile = File(...),
     mode: str = Form("VECTORS"),
     is_moving: Optional[bool] = Form(None),
-    isMoving: Optional[bool] = Form(None)
+    isMoving: Optional[bool] = Form(None),
+    roi_enabled: Optional[bool] = Form(None),
+    roi_left: Optional[float] = Form(None),
+    roi_top: Optional[float] = Form(None),
+    roi_right: Optional[float] = Form(None),
+    roi_bottom: Optional[float] = Form(None),
+    roi_view_aspect_ratio: Optional[float] = Form(None),
+    roi_path_points: Optional[str] = Form(None),
 ):
     """
     Process a video using the RAFT Optical Flow model.
@@ -456,6 +569,16 @@ async def process_video(
     if not processor:
         logger.error("Synchronous process-video rejected because model is not loaded filename=%s", file.filename)
         return {"error": "Model not loaded on server."}
+
+    roi = resolve_roi(
+        roi_enabled,
+        roi_left,
+        roi_top,
+        roi_right,
+        roi_bottom,
+        roi_view_aspect_ratio,
+        roi_path_points,
+    )
 
     # Save uploaded video to system temporary files
     input_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
@@ -473,13 +596,14 @@ async def process_video(
     mode_name = mode.upper()
     input_size = os.path.getsize(input_path) if os.path.exists(input_path) else -1
     logger.info(
-        "Synchronous video processing started filename=%s mode=%s raw_is_moving=%s raw_isMoving=%s resolved_is_moving=%s vector_direction_sign=%.1f input_path=%s input_size_bytes=%s output_path=%s",
+        "Synchronous video processing started filename=%s mode=%s raw_is_moving=%s raw_isMoving=%s resolved_is_moving=%s vector_direction_sign=%.1f roi=%s input_path=%s input_size_bytes=%s output_path=%s",
         file.filename,
         mode_name,
         is_moving,
         isMoving,
         resolved_is_moving,
         vector_direction_sign,
+        roi_log_payload(roi),
         input_path,
         input_size,
         output_path,
@@ -487,7 +611,7 @@ async def process_video(
 
     try:
         # Process the video (no status file)
-        processor.process_video(input_path, output_path, mode=mode_name, vector_direction_sign=vector_direction_sign)
+        processor.process_video(input_path, output_path, mode=mode_name, vector_direction_sign=vector_direction_sign, roi=roi)
 
         # Schedule cleanup after sending response
         background_tasks.add_task(cleanup_files, [input_path, output_path])
@@ -512,7 +636,14 @@ async def create_process_video_job(
     file: UploadFile = File(...),
     mode: str = Form("VECTORS"),
     is_moving: Optional[bool] = Form(None),
-    isMoving: Optional[bool] = Form(None)
+    isMoving: Optional[bool] = Form(None),
+    roi_enabled: Optional[bool] = Form(None),
+    roi_left: Optional[float] = Form(None),
+    roi_top: Optional[float] = Form(None),
+    roi_right: Optional[float] = Form(None),
+    roi_bottom: Optional[float] = Form(None),
+    roi_view_aspect_ratio: Optional[float] = Form(None),
+    roi_path_points: Optional[str] = Form(None),
 ):
     """
     Create an async video-processing job for Cloudflare Tunnel clients.
@@ -523,6 +654,16 @@ async def create_process_video_job(
         raise HTTPException(status_code=503, detail="Model not loaded on server.")
 
     reject_if_video_job_queue_full(file.filename)
+
+    roi = resolve_roi(
+        roi_enabled,
+        roi_left,
+        roi_top,
+        roi_right,
+        roi_bottom,
+        roi_view_aspect_ratio,
+        roi_path_points,
+    )
 
     input_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     input_path = input_temp.name
@@ -538,6 +679,7 @@ async def create_process_video_job(
         filename=file.filename or "input.mp4",
         mode_name=mode_name,
         resolved_is_moving=resolved_is_moving,
+        roi=roi,
     )
 
 
@@ -679,6 +821,13 @@ def complete_process_video_upload(
     mode: str = Form("VECTORS"),
     is_moving: Optional[bool] = Form(None),
     isMoving: Optional[bool] = Form(None),
+    roi_enabled: Optional[bool] = Form(None),
+    roi_left: Optional[float] = Form(None),
+    roi_top: Optional[float] = Form(None),
+    roi_right: Optional[float] = Form(None),
+    roi_bottom: Optional[float] = Form(None),
+    roi_view_aspect_ratio: Optional[float] = Form(None),
+    roi_path_points: Optional[str] = Form(None),
 ):
     if not processor:
         logger.error("Chunked process-video job rejected because model is not loaded upload_id=%s", upload_id)
@@ -694,6 +843,16 @@ def complete_process_video_upload(
             status_code=409,
             detail=f"Upload is missing chunks: {missing[:10]}{'...' if len(missing) > 10 else ''}",
         )
+
+    roi = resolve_roi(
+        roi_enabled,
+        roi_left,
+        roi_top,
+        roi_right,
+        roi_bottom,
+        roi_view_aspect_ratio,
+        roi_path_points,
+    )
 
     input_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     input_path = input_temp.name
@@ -726,6 +885,7 @@ def complete_process_video_upload(
             filename=upload.file_name,
             mode_name=mode.upper(),
             resolved_is_moving=resolve_is_moving(is_moving, isMoving),
+            roi=roi,
         )
     except HTTPException:
         raise
