@@ -37,11 +37,14 @@ app.add_middleware(
 )
 
 # Initialize the model processor
+FP16_MODEL = "optical_flow_estimation_raft_2023aug_fp16.onnx"
 DEFAULT_MODEL = "optical_flow_estimation_raft_2023aug_int8bq.onnx"
 DEQUANT_MODEL = "optical_flow_estimation_raft_2023aug_dequant.onnx"
 ALT_MODEL = "optical_flow_estimation_raft_2023aug.onnx"
-# Prefer dequantized float model, then alternate float model, then default int8 model
-if os.path.exists(DEQUANT_MODEL):
+# Prefer FP16 model (fastest on GPU), then dequantized float model, then alternate float model, then default int8 model
+if os.path.exists(FP16_MODEL):
+    MODEL_PATH = FP16_MODEL
+elif os.path.exists(DEQUANT_MODEL):
     MODEL_PATH = DEQUANT_MODEL
 elif os.path.exists(ALT_MODEL):
     MODEL_PATH = ALT_MODEL

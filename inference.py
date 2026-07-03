@@ -10,6 +10,8 @@ import onnxruntime as ort
 from dataclasses import dataclass
 from typing import Optional
 
+from motion_analyzer import MotionAnalyzer
+
 try:
     import imageio_ffmpeg
 except ImportError:
@@ -527,11 +529,12 @@ class OpticalFlowProcessor:
         if active.size == 0:
             return frame
 
+        active_downsampled = active[::16] if active.size > 10000 else active
         motion_floor = max(
             self.min_motion_magnitude,
-            float(np.percentile(active, self.heatmap_floor_percentile)) * 0.75,
+            float(np.percentile(active_downsampled, self.heatmap_floor_percentile)) * 0.75,
         )
-        motion_peak = float(np.percentile(active, self.heatmap_peak_percentile))
+        motion_peak = float(np.percentile(active_downsampled, self.heatmap_peak_percentile))
         motion_peak = max(motion_peak, motion_floor + 1e-3)
 
         normalized = np.clip((magnitude - motion_floor) / (motion_peak - motion_floor), 0.0, 1.0)
@@ -547,19 +550,30 @@ class OpticalFlowProcessor:
             self.heatmap_min_alpha + normalized * (self.heatmap_max_alpha - self.heatmap_min_alpha),
             0.0,
         ).astype(np.float32)
-        alpha = cv2.resize(alpha_small, (frame_w, frame_h), interpolation=cv2.INTER_CUBIC)
-        alpha = np.clip(cv2.GaussianBlur(alpha, (0, 0), 1.8), 0.0, self.heatmap_max_alpha)
+
+        # Blur the small alpha mask before resizing
+        small_blur_sigma = max(0.5, 1.8 / max(x_scale, y_scale))
+        alpha_small_blurred = cv2.GaussianBlur(alpha_small, (0, 0), small_blur_sigma)
+        alpha_small_blurred = np.clip(alpha_small_blurred, 0.0, self.heatmap_max_alpha)
+
+        alpha = cv2.resize(alpha_small_blurred, (frame_w, frame_h), interpolation=cv2.INTER_CUBIC)
         alpha3 = alpha[:, :, np.newaxis]
 
-        base = cv2.addWeighted(
-            frame,
-            self.heatmap_background_weight,
-            np.zeros_like(frame),
-            1.0 - self.heatmap_background_weight,
-            0.0,
-        ).astype(np.float32)
-        result_frame = base * (1.0 - alpha3) + heatmap_scaled_bgr.astype(np.float32) * alpha3
-        result_frame = np.clip(result_frame, 0, 255).astype(np.uint8)
+        # OpenCV-based multi-threaded blending
+        inv_alpha = 1.0 - alpha3
+        inv_alpha *= self.heatmap_background_weight
+        
+        inv_alpha_3ch = cv2.merge([inv_alpha, inv_alpha, inv_alpha])
+        alpha_3ch = cv2.merge([alpha3, alpha3, alpha3])
+        
+        f_float = frame.astype(np.float32)
+        h_float = heatmap_scaled_bgr.astype(np.float32)
+        
+        part1 = cv2.multiply(f_float, inv_alpha_3ch)
+        part2 = cv2.multiply(h_float, alpha_3ch)
+        
+        result_frame = cv2.add(part1, part2)
+        result_frame = np.clip(result_frame, 0, 255, out=result_frame).astype(np.uint8)
 
         return result_frame
 
@@ -709,6 +723,7 @@ class OpticalFlowProcessor:
         req_id: str = None,
         progress_callback=None,
         cancel_callback=None,
+        is_moving: bool = True,
     ):
         mode = (mode or "VECTORS").upper()
         if mode == "VECTOR":
@@ -785,6 +800,9 @@ class OpticalFlowProcessor:
             if fps == 0 or np.isnan(fps):
                 logger.warning("Invalid FPS metadata, using fallback FPS job_id=%s raw_fps=%s fallback_fps=30.0", req_id, fps)
                 fps = 30.0
+
+            # Initialize motion analyzer for anomaly detection
+            analyzer = MotionAnalyzer(fps=fps, is_moving=is_moving)
 
             try:
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -867,6 +885,9 @@ class OpticalFlowProcessor:
                             self.summarize_flow(flow_output),
                         )
 
+                    # Analyze flow for motion anomalies (lightweight numpy ops)
+                    analyzer.analyze_frame(flow_output, frame_index)
+
                     result_frame = self.draw_flow_result(
                         flow_output,
                         source_frame,
@@ -908,12 +929,15 @@ class OpticalFlowProcessor:
             out.release()
             out = None
             completed = True
+
+            detected_alerts = analyzer.get_alerts()
             logger.info(
-                "Video processing finished job_id=%s mode=%s frames_processed=%s total_frames=%s codec=h264",
+                "Video processing finished job_id=%s mode=%s frames_processed=%s total_frames=%s codec=h264 detected_alerts=%s",
                 req_id,
                 mode,
                 frames_processed,
                 total_frames,
+                len(detected_alerts),
             )
         finally:
             cap.release()
@@ -924,3 +948,5 @@ class OpticalFlowProcessor:
                     out.release()
             if completed:
                 report_progress(100)
+
+        return detected_alerts if completed else []
